@@ -5,6 +5,7 @@ import Vision
 struct RecognizedPlate: Identifiable, Equatable {
     let id = UUID()
     let value: String
+    let imageData: Data?
 }
 
 final class PlateScanner: NSObject, ObservableObject {
@@ -14,12 +15,15 @@ final class PlateScanner: NSObject, ObservableObject {
 
     private let cameraQueue = DispatchQueue(label: "dinnerplate.camera")
     private let visionQueue = DispatchQueue(label: "dinnerplate.vision")
+    private let photoOutput = AVCapturePhotoOutput()
 
     private var isConfigured = false
     private var isProcessingFrame = false
+    private var isPhotoCaptureEnabled = true
     private var lastScanDate = Date.distantPast
     private var lastPresentedValue: String?
     private var lastPresentedDate = Date.distantPast
+    private var photoDelegates: [Int64: PhotoCaptureDelegate] = [:]
 
     func start() async {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -32,6 +36,12 @@ final class PlateScanner: NSObject, ObservableObject {
             }
         default:
             break
+        }
+    }
+
+    func setPhotoCaptureEnabled(_ isEnabled: Bool) {
+        cameraQueue.async { [weak self] in
+            self?.isPhotoCaptureEnabled = isEnabled
         }
     }
 
@@ -84,6 +94,12 @@ final class PlateScanner: NSObject, ObservableObject {
         }
 
         session.addInput(input)
+
+        guard session.canAddOutput(photoOutput) else {
+            return false
+        }
+
+        session.addOutput(photoOutput)
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
@@ -142,7 +158,7 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
                 return
             }
 
-            self?.present(plate)
+            self?.handleRecognizedPlate(plate)
         }
 
         request.recognitionLevel = .accurate
@@ -158,7 +174,7 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 
-    private func present(_ plate: String) {
+    private func handleRecognizedPlate(_ plate: String) {
         let now = Date()
         guard plate != lastPresentedValue || now.timeIntervalSince(lastPresentedDate) > 8 else {
             return
@@ -167,8 +183,52 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
         lastPresentedValue = plate
         lastPresentedDate = now
 
-        DispatchQueue.main.async { [weak self] in
-            self?.detectedPlate = RecognizedPlate(value: plate)
+        cameraQueue.async { [weak self] in
+            guard let self, self.isPhotoCaptureEnabled else {
+                self?.present(plate, imageData: nil)
+                return
+            }
+
+            self.capturePhoto(for: plate)
         }
+    }
+
+    private func capturePhoto(for plate: String) {
+        let settings = AVCapturePhotoSettings()
+        let delegate = PhotoCaptureDelegate { [weak self] imageData in
+            guard let self else {
+                return
+            }
+
+            self.present(plate, imageData: imageData)
+            self.cameraQueue.async {
+                self.photoDelegates[settings.uniqueID] = nil
+            }
+        }
+
+        photoDelegates[settings.uniqueID] = delegate
+        photoOutput.capturePhoto(with: settings, delegate: delegate)
+    }
+
+    private func present(_ plate: String, imageData: Data?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.detectedPlate = RecognizedPlate(value: plate, imageData: imageData)
+        }
+    }
+}
+
+private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+    private let completion: (Data?) -> Void
+
+    init(completion: @escaping (Data?) -> Void) {
+        self.completion = completion
+    }
+
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        didFinishProcessingPhoto photo: AVCapturePhoto,
+        error: Error?
+    ) {
+        completion(error == nil ? photo.fileDataRepresentation() : nil)
     }
 }

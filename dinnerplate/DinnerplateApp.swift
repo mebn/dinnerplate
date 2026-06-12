@@ -1,3 +1,4 @@
+import SwiftData
 import SwiftUI
 
 @main
@@ -6,5 +7,6 @@ struct DinnerplateApp: App {
         WindowGroup {
             ContentView()
         }
+        .modelContainer(for: [PlateCapture.self, ScannerSettings.self])
     }
 }
