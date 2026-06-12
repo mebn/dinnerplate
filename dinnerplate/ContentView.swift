@@ -49,11 +49,13 @@ private struct CameraView: View {
     @StateObject private var scanner = PlateScanner()
 
     var body: some View {
-        CameraPreview(session: scanner.session)
+        CameraPreview(session: scanner.session) { scale in
+            scanner.zoom(by: scale)
+        }
             .ignoresSafeArea()
             .background(.black)
-            .statusBarHidden(true)
             .task {
+                ensureSettings()
                 scanner.setPhotoCaptureEnabled(takePictures)
                 await scanner.start()
             }
@@ -64,13 +66,14 @@ private struct CameraView: View {
                 scanner.setPhotoCaptureEnabled(isEnabled)
             }
             .onChange(of: scanner.detectedPlate) { _, plate in
-                saveCaptureIfNeeded(plate)
+                handleDetectedPlate(plate)
             }
-            .sheet(item: $scanner.detectedPlate) { plate in
+            .onChange(of: scanner.completedCapture) { _, capture in
+                handleCompletedCapture(capture)
+            }
+            .sheet(item: $scanner.detectedPlate, onDismiss: resumeCameraIfNeeded) { plate in
                 PlateSheet(plate: plate.value)
-                    .presentationDetents([.height(180)])
-                    .presentationDragIndicator(.visible)
-                    .presentationCornerRadius(18)
+                    .plateSheetPresentation()
             }
     }
 
@@ -78,24 +81,68 @@ private struct CameraView: View {
         settings.first?.takePictures ?? true
     }
 
-    private func saveCaptureIfNeeded(_ plate: RecognizedPlate?) {
-        guard takePictures, let plate, let imageData = plate.imageData else {
+    private var pauseCameraOnSheet: Bool {
+        settings.first?.pauseCameraOnSheet ?? false
+    }
+
+    private func handleDetectedPlate(_ plate: RecognizedPlate?) {
+        guard pauseCameraOnSheet, plate != nil, !takePictures else {
+            return
+        }
+
+        scanner.stop()
+    }
+
+    private func handleCompletedCapture(_ capture: CapturedPlatePhoto?) {
+        saveCaptureIfNeeded(capture)
+
+        guard pauseCameraOnSheet, capture != nil else {
+            return
+        }
+
+        scanner.stop()
+    }
+
+    private func saveCaptureIfNeeded(_ capture: CapturedPlatePhoto?) {
+        guard takePictures, let capture, let imageData = capture.imageData else {
             return
         }
 
         modelContext.insert(
             PlateCapture(
-                plateNumber: plate.value,
+                plateNumber: capture.value,
                 imageData: imageData,
                 capturedAt: Date()
             )
         )
+        try? modelContext.save()
+    }
+
+    private func resumeCameraIfNeeded() {
+        guard pauseCameraOnSheet else {
+            return
+        }
+
+        Task {
+            await scanner.start()
+        }
+    }
+
+    private func ensureSettings() {
+        guard settings.isEmpty else {
+            return
+        }
+
+        modelContext.insert(ScannerSettings())
+        try? modelContext.save()
     }
 }
 
 private struct HistoryView: View {
+    @Environment(\.modelContext) private var modelContext
     @Query(sort: \PlateCapture.capturedAt, order: .reverse) private var captures: [PlateCapture]
     @State private var selectedCapture: PlateCapture?
+    @State private var capturePendingDeletion: PlateCapture?
 
     private let columns = [
         GridItem(.adaptive(minimum: 132), spacing: 12)
@@ -106,12 +153,15 @@ private struct HistoryView: View {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 12) {
                     ForEach(captures) { capture in
-                        Button {
-                            selectedCapture = capture
-                        } label: {
-                            CaptureThumbnail(capture: capture)
-                        }
-                        .buttonStyle(.plain)
+                        CaptureGridItem(
+                            capture: capture,
+                            select: {
+                                selectedCapture = capture
+                            },
+                            delete: {
+                                capturePendingDeletion = capture
+                            }
+                        )
                     }
                 }
                 .padding(12)
@@ -119,10 +169,60 @@ private struct HistoryView: View {
             .navigationTitle("History")
             .sheet(item: $selectedCapture) { capture in
                 PlateSheet(plate: capture.plateNumber)
-                    .presentationDetents([.height(180)])
-                    .presentationDragIndicator(.visible)
-                    .presentationCornerRadius(18)
+                    .plateSheetPresentation()
             }
+            .alert("Delete this picture?", isPresented: isConfirmingDelete) {
+                Button("Cancel", role: .cancel) {
+                    capturePendingDeletion = nil
+                }
+
+                Button("Delete", role: .destructive) {
+                    if let capture = capturePendingDeletion {
+                        modelContext.delete(capture)
+                        try? modelContext.save()
+                    }
+
+                    capturePendingDeletion = nil
+                }
+            } message: {
+                Text(capturePendingDeletion?.plateNumber ?? "")
+            }
+        }
+    }
+
+    private var isConfirmingDelete: Binding<Bool> {
+        Binding {
+            capturePendingDeletion != nil
+        } set: { isPresented in
+            if !isPresented {
+                capturePendingDeletion = nil
+            }
+        }
+    }
+}
+
+private struct CaptureGridItem: View {
+    let capture: PlateCapture
+    let select: () -> Void
+    let delete: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Button(action: select) {
+                CaptureThumbnail(capture: capture)
+            }
+            .buttonStyle(.plain)
+
+            Button(action: delete) {
+                Image(systemName: "trash")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(7)
+            .accessibilityLabel("Delete picture")
         }
     }
 }
@@ -164,49 +264,122 @@ private struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Toggle("Take pictures", isOn: takePicturesBinding)
+                if let settings = settings.first {
+                    SettingsForm(settings: settings)
+                }
             }
             .navigationTitle("Settings")
+            .task {
+                ensureSettings()
+            }
         }
     }
 
-    private var takePicturesBinding: Binding<Bool> {
-        Binding {
-            settings.first?.takePictures ?? true
-        } set: { newValue in
-            let settings = settings.first ?? createSettings()
-            settings.takePictures = newValue
+    private func ensureSettings() {
+        guard settings.isEmpty else {
+            return
         }
-    }
 
-    private func createSettings() -> ScannerSettings {
-        let settings = ScannerSettings()
-        modelContext.insert(settings)
-        return settings
+        modelContext.insert(ScannerSettings())
+        try? modelContext.save()
+    }
+}
+
+private struct SettingsForm: View {
+    @Environment(\.modelContext) private var modelContext
+    @Bindable var settings: ScannerSettings
+
+    var body: some View {
+        Toggle("Take pictures", isOn: $settings.takePictures)
+            .onChange(of: settings.takePictures) { _, _ in
+                try? modelContext.save()
+            }
+
+        Toggle("Pause camera while sheet is open", isOn: $settings.pauseCameraOnSheet)
+            .onChange(of: settings.pauseCameraOnSheet) { _, _ in
+                try? modelContext.save()
+            }
     }
 }
 
 private struct PlateSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
     let plate: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Plate")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                SwedishPlateView(plate: plate)
+
+                Link("More info", destination: moreInfoURL)
+                    .font(.headline)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .navigationTitle("Plate")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .accessibilityLabel("Close")
+                }
+            }
+        }
+    }
+
+    private var moreInfoURL: URL {
+        URL(string: "https://biluppgifter.se/fordon/\(plate.replacingOccurrences(of: " ", with: ""))")!
+    }
+}
+
+private struct SwedishPlateView: View {
+    let plate: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 2) {
+                Text("S")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 50)
+            .frame(maxHeight: .infinity)
+            .background(Color(red: 0.0, green: 0.22, blue: 0.64))
 
             Text(plate)
-                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .font(.system(size: 46, weight: .bold, design: .rounded))
                 .monospaced()
+                .foregroundStyle(.black)
                 .lineLimit(1)
-                .minimumScaleFactor(0.65)
-                .accessibilityLabel("Registration plate \(plate)")
-
-            Spacer(minLength: 0)
+                .minimumScaleFactor(0.6)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 18)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 24)
-        .padding(.top, 24)
+        .frame(height: 88)
+        .background(.white)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(.black.opacity(0.25), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .accessibilityLabel("Registration plate \(plate)")
+    }
+}
+
+private extension View {
+    func plateSheetPresentation() -> some View {
+        presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(18)
     }
 }
 

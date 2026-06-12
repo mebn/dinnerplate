@@ -23,11 +23,17 @@ final class PlateCapture: Identifiable {
 
 @Model
 final class ScannerSettings {
-    @Attribute(.unique) var id: String
-    var takePictures: Bool
+    @Attribute(.unique) var id: String = "scanner-settings"
+    var takePictures: Bool = true
+    var pauseCameraOnSheet: Bool = false
 
-    init(id: String = "scanner-settings", takePictures: Bool = true) {
+    init(
+        id: String = "scanner-settings",
+        takePictures: Bool = true,
+        pauseCameraOnSheet: Bool = false
+    ) {
         self.id = id
         self.takePictures = takePictures
+        self.pauseCameraOnSheet = pauseCameraOnSheet
     }
 }

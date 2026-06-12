@@ -5,6 +5,11 @@ import Vision
 struct RecognizedPlate: Identifiable, Equatable {
     let id = UUID()
     let value: String
+}
+
+struct CapturedPlatePhoto: Identifiable, Equatable {
+    let id = UUID()
+    let value: String
     let imageData: Data?
 }
 
@@ -12,11 +17,13 @@ final class PlateScanner: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
     @Published var detectedPlate: RecognizedPlate?
+    @Published var completedCapture: CapturedPlatePhoto?
 
     private let cameraQueue = DispatchQueue(label: "dinnerplate.camera")
     private let visionQueue = DispatchQueue(label: "dinnerplate.vision")
     private let photoOutput = AVCapturePhotoOutput()
 
+    private var videoDevice: AVCaptureDevice?
     private var isConfigured = false
     private var isProcessingFrame = false
     private var isPhotoCaptureEnabled = true
@@ -42,6 +49,24 @@ final class PlateScanner: NSObject, ObservableObject {
     func setPhotoCaptureEnabled(_ isEnabled: Bool) {
         cameraQueue.async { [weak self] in
             self?.isPhotoCaptureEnabled = isEnabled
+        }
+    }
+
+    func zoom(by scale: CGFloat) {
+        cameraQueue.async { [weak self] in
+            guard let device = self?.videoDevice else {
+                return
+            }
+
+            do {
+                try device.lockForConfiguration()
+                let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 8)
+                let nextZoom = min(max(device.videoZoomFactor * scale, 1), maxZoom)
+                device.videoZoomFactor = nextZoom
+                device.unlockForConfiguration()
+            } catch {
+                return
+            }
         }
     }
 
@@ -94,6 +119,7 @@ final class PlateScanner: NSObject, ObservableObject {
         }
 
         session.addInput(input)
+        videoDevice = device
 
         guard session.canAddOutput(photoOutput) else {
             return false
@@ -182,10 +208,10 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         lastPresentedValue = plate
         lastPresentedDate = now
+        present(plate)
 
         cameraQueue.async { [weak self] in
             guard let self, self.isPhotoCaptureEnabled else {
-                self?.present(plate, imageData: nil)
                 return
             }
 
@@ -200,7 +226,7 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
                 return
             }
 
-            self.present(plate, imageData: imageData)
+            self.publishCompletedCapture(plate, imageData: imageData)
             self.cameraQueue.async {
                 self.photoDelegates[settings.uniqueID] = nil
             }
@@ -210,9 +236,15 @@ extension PlateScanner: AVCaptureVideoDataOutputSampleBufferDelegate {
         photoOutput.capturePhoto(with: settings, delegate: delegate)
     }
 
-    private func present(_ plate: String, imageData: Data?) {
+    private func present(_ plate: String) {
         DispatchQueue.main.async { [weak self] in
-            self?.detectedPlate = RecognizedPlate(value: plate, imageData: imageData)
+            self?.detectedPlate = RecognizedPlate(value: plate)
+        }
+    }
+
+    private func publishCompletedCapture(_ plate: String, imageData: Data?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.completedCapture = CapturedPlatePhoto(value: plate, imageData: imageData)
         }
     }
 }
